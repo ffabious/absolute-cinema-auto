@@ -1,0 +1,34 @@
+scene:
+  primary_ply: input/ConferenceHall.ply
+  fallback_ply: input/scene.ply
+music:
+  track_path: input/music.mp3
+render:
+  fps: 30
+  resolution:
+    width: 1280
+    height: 720
+  min_duration_seconds: 60
+  max_duration_seconds: 110
+  lateral_margin_ratio: 0.2
+  zoom_margin_ratio: 0.08
+shots:
+  beats_per_shot: [16, 12, 8, 12]
+  orbit_altitude_ratio: 0.35
+  dolly_altitude_ratio: 0.15
+  safety_margin_ratio: 0.08
+  clearance_ratio: 0.12
+  shot_mix:
+    wide_lateral: 0.7
+    zoom_focus: 0.3
+    orbit: 0.0
+    elevated_dolly: 0.0
+  ease: smoothstep
+paths:
+  working_dir: outputs/scene_1
+  frames_dir: outputs/scene_1/frames
+  scene_report: outputs/scene_1/scene_analysis.json
+  beats_report: outputs/scene_1/beat_times.json
+  shots_report: outputs/scene_1/shots.json
+  renderer_config: outputs/scene_1/runtime_config.json
+  video_output: outputs/scene_1/panorama_tour.mp4

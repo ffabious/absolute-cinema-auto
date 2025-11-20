@@ -1,0 +1,9 @@
+numpy>=1.26
+scipy>=1.11
+librosa>=0.10
+soundfile>=0.12
+plyfile>=0.9
+PyYAML>=6.0
+tqdm>=4.66
+fpdf2>=2.7
+reportlab>=4.0
