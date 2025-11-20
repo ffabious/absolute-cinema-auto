@@ -16,3 +16,5 @@ renderer/package-lock.json
 *.ply
 *.mp3
 *.mp4
+*.png
+frames/
