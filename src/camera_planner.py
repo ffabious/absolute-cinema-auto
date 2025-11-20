@@ -326,6 +326,62 @@ class CameraPlanner:
                 description="Lateral tracking shot with fixed orientation",
             )
 
+        # Secondary search: Relaxed constraints to avoid fallback
+        # Try to find ANY valid spot that looks at a cluster or the center
+        for attempt in range(200):
+            # Pick a random point in flight bounds
+            r = np.random.rand(3)
+            cam_center = self.flight_min + r * (self.flight_max - self.flight_min)
+            
+            # Check collision with slightly reduced radius (0.9x)
+            if self._is_in_collision(cam_center, radius_multiplier=0.9):
+                continue
+                
+            # Determine focus
+            if self.clusters:
+                dists = [np.linalg.norm(cam_center - np.array(c["center"])) for c in self.clusters]
+                focus = np.array(self.clusters[np.argmin(dists)]["center"])
+            else:
+                focus = self.motion_center
+            
+            # Check LOS with reduced multiplier
+            if self._path_intersects_obstacle(cam_center, focus, radius_multiplier=1.0):
+                continue
+                
+            # Found a valid spot! Create a simple subtle motion
+            # Move slightly perpendicular to view direction
+            view_vec = focus - cam_center
+            view_dir = view_vec / np.linalg.norm(view_vec)
+            right = np.cross(view_dir, np.array([0, 1, 0]))
+            if np.linalg.norm(right) < 0.1:
+                right = np.array([1, 0, 0])
+            right /= np.linalg.norm(right)
+            
+            travel_dist = 1.0 + np.random.rand() * 2.0
+            start = cam_center - right * travel_dist * 0.5
+            end = cam_center + right * travel_dist * 0.5
+            
+            # Ensure start/end are valid
+            if self._is_in_collision(start, radius_multiplier=0.9) or self._is_in_collision(end, radius_multiplier=0.9):
+                continue
+                
+            print(f"[Planner] Shot {shot_id} (wide_lateral - RELAXED): Found spot after standard search failed. Dist={np.linalg.norm(view_vec):.2f}")
+            
+            keyframes = [
+                {"time": start_time, "position": start.tolist(), "target": focus.tolist()},
+                {"time": end_time, "position": end.tolist(), "target": focus.tolist()},
+            ]
+            
+            return self._package_shot(
+                shot_id,
+                "wide_lateral",
+                start_time,
+                end_time,
+                beat_range,
+                self._finalize_keyframes(keyframes),
+                description="Relaxed constraint lateral shot",
+            )
+
         # Fallback if random search fails (use safe defaults)
         print(f"[Planner] Shot {shot_id} (wide_lateral): attempts={attempt+1}, used_rejects={used_rejections}, coll_rejects={collision_rejections}, los_rejects={los_rejections}, path_rejects={path_rejections}")
         center = self.motion_center.copy()
@@ -846,6 +902,17 @@ class CameraPlanner:
             current_pos += vertical_dir * step_size
             if not self._is_in_collision(current_pos):
                 return current_pos
+
+        # If deterministic resolution fails, try random perturbations
+        for _ in range(20):
+            random_dir = np.random.randn(3)
+            random_dir /= np.linalg.norm(random_dir)
+            # Try varying distances
+            for dist in [0.5, 1.0, 2.0, 3.0]:
+                candidate = point + random_dir * dist
+                candidate = self._clamp_point(candidate)
+                if not self._is_in_collision(candidate):
+                    return candidate
 
         return point
 
