@@ -380,7 +380,7 @@ class CameraPlanner:
             
             # 7. Define Travel Path
             scene_diag = np.linalg.norm(self.motion_extent)
-            base_travel = 0.1 * scene_diag + np.random.rand() * 0.15 * scene_diag
+            base_travel = 0.05 * scene_diag + np.random.rand() * 0.1 * scene_diag
             
             # Reduce travel distance in desperation mode to find a valid path
             if attempt > 800:
@@ -416,11 +416,18 @@ class CameraPlanner:
             # Target(t) = Position(t) + ViewVector
             fixed_view_vec = candidate_focus - cam_center
             
+            # Add small random angle change (randomly selected)
+            # We perturb the end view vector slightly to introduce a subtle rotation
+            view_dist = np.linalg.norm(fixed_view_vec)
+            # Random offset ~10% of distance => ~5-6 degrees rotation
+            angle_offset = (np.random.rand(3) - 0.5) * 0.2 * view_dist
+            end_view_vec = fixed_view_vec + angle_offset
+
             print(f"[Planner] Shot {shot_id} (wide_lateral): Focus={candidate_focus.round(2)}, Dist={dist:.2f}, Height={cam_center[1]:.2f}, Travel={travel_dist:.2f}")
 
             keyframes = [
                 {"time": start_time, "position": start.tolist(), "target": (start + fixed_view_vec).tolist()},
-                {"time": end_time, "position": end.tolist(), "target": (end + fixed_view_vec).tolist()},
+                {"time": end_time, "position": end.tolist(), "target": (end + end_view_vec).tolist()},
             ]
             
             return self._package_shot(
@@ -430,7 +437,7 @@ class CameraPlanner:
                 end_time,
                 beat_range,
                 self._finalize_keyframes(keyframes, fix_orientation=True),
-                description="Lateral tracking shot with fixed orientation",
+                description="Lateral tracking shot with subtle rotation",
             )
 
         print(f"[Planner] Shot {shot_id} (wide_lateral): Failed after {attempt+1} attempts. Rejects: used={used_rejections}, coll={collision_rejections}, los={los_rejections}, path={path_rejections}")
@@ -610,7 +617,7 @@ class CameraPlanner:
     def _build_dolly_shot(self, shot_id: str, start_time: float, end_time: float, beat_range) -> Dict:
         axis = self._horizontal_axis(self.axes[1])
         center = self.motion_center.copy()
-        travel = 0.25 * np.linalg.norm(self.motion_extent)
+        travel = 0.15 * np.linalg.norm(self.motion_extent)
         if self.is_indoor:
             travel *= 0.6
         elif self.is_outdoor:
@@ -643,7 +650,7 @@ class CameraPlanner:
         focus = self._clamp_point(np.array(self._choose_focus_cluster(cluster_idx)))
         axis = self._horizontal_axis(self.axes[2])
         planar_span = max(1e-3, min(self.motion_extent[0], self.motion_extent[2]))
-        offset = 0.3 * planar_span
+        offset = 0.2 * planar_span
         side = -1.0 if self._shot_number(shot_id) % 2 == 0 else 1.0
         start = focus + axis * side * offset
         end = focus - axis * 0.4 * side * offset
@@ -682,7 +689,7 @@ class CameraPlanner:
         corner[1] = self._height_at_ratio(0.48)
         center[1] = self._height_at_ratio(0.5)
         offset_axis = self._horizontal_axis(self.axes[0] + self.axes[2])
-        offset = offset_axis * 0.1 * np.linalg.norm(self.motion_extent)
+        offset = offset_axis * 0.07 * np.linalg.norm(self.motion_extent)
         
         if self._is_direction_similar(corner, center):
              corner = corners[(self._shot_number(shot_id) + 1) % len(corners)].copy()

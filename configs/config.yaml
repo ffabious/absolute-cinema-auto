@@ -13,7 +13,7 @@ render:
   lateral_margin_ratio: 0.2
   zoom_margin_ratio: 0.08
 shots:
-  beats_per_shot: [16, 12, 8, 12]
+  beats_per_shot: [32, 24, 16, 24]
   orbit_altitude_ratio: 0.35
   dolly_altitude_ratio: 0.15
   safety_margin_ratio: 0.08
