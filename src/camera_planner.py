@@ -99,7 +99,8 @@ class CameraPlanner:
         self.obstacle_tree = KDTree(self.obstacles) if self.obstacles.size > 0 else None
         # Collision radius scales with scene size; smaller for dense indoor scenes to avoid false positives
         diag = float(np.linalg.norm(self.motion_extent))
-        self.collision_radius = float(max(0.8, min(2.5, 0.02 * max(diag, 1.0))))
+        # Increased base radius for better safety
+        self.collision_radius = float(max(1.2, min(3.0, 0.03 * max(diag, 1.0))))
         self.used_focus_points: List[np.ndarray] = []
         self.last_zoom_angle: float | None = None
 
@@ -125,16 +126,27 @@ class CameraPlanner:
             end_time = beat_times[end_idx]
             if end_time - beat_times[0] > target_duration:
                 break
-            shot_id, builder = next(shot_generators)
-            shot = builder(
-                shot_id=f"shot_{shot_counter:02d}",
-                start_time=start_time,
-                end_time=end_time,
-                beat_range=(start_idx, end_idx),
-            )
+            
+            # Try to generate a shot, retrying with different types if needed
+            shot = None
+            # Limit retries to avoid infinite loops, but try enough to cycle through types
+            for _ in range(5):
+                shot_id_template, builder = next(shot_generators)
+                shot = builder(
+                    shot_id=f"shot_{shot_counter:02d}",
+                    start_time=start_time,
+                    end_time=end_time,
+                    beat_range=(start_idx, end_idx),
+                )
+                if shot:
+                    break
+            
             if shot:
                 timeline.append(shot)
                 shot_counter += 1
+            else:
+                print(f"[Planner] Failed to generate shot {shot_counter} for time {start_time:.2f}-{end_time:.2f}")
+
             beat_index = end_idx
 
         offset = beat_times[0]
@@ -231,6 +243,16 @@ class CameraPlanner:
             if any(np.linalg.norm(candidate_focus - p) < 5.0 for p in self.used_focus_points[-8:]):
                 used_rejections += 1
                 continue
+            
+            # Check if we've used a similar camera center recently (check last 5 shots)
+            # This prevents "looking at the same place from a little bit different angle"
+            # We don't have the exact camera centers of previous shots easily available here, 
+            # but we can approximate by checking if the focus point AND the angle are similar.
+            # Or we can just rely on the focus point check above which is quite strict (5.0 units).
+            
+            # Let's add a check for the camera center itself if we can.
+            # Since we haven't calculated cam_center yet, we can't check it here.
+            # We will check it after calculating cam_center.
 
             # 2. Pick a viewing direction (random angle in horizontal plane)
             angle = np.random.rand() * 2 * np.pi
@@ -336,28 +358,61 @@ class CameraPlanner:
             # Check collision with slightly reduced radius (0.9x)
             if self._is_in_collision(cam_center, radius_multiplier=0.9):
                 continue
+
+            # Enforce enclosure check for indoor scenes to prevent being outside walls
+            if self.is_indoor and not self._check_enclosure(cam_center):
+                continue
                 
-            # Determine focus
+            # Determine focus with variety check
             if self.clusters:
                 dists = [np.linalg.norm(cam_center - np.array(c["center"])) for c in self.clusters]
-                focus = np.array(self.clusters[np.argmin(dists)]["center"])
+                sorted_indices = np.argsort(dists)
+                
+                # Try nearest 3 clusters to avoid repetition
+                chosen_focus = None
+                for idx in sorted_indices[:3]:
+                    candidate = np.array(self.clusters[idx]["center"])
+                    # Check if used recently (last 5 shots)
+                    if any(np.linalg.norm(candidate - p) < 4.0 for p in self.used_focus_points[-5:]):
+                        continue
+                    chosen_focus = candidate
+                    break
+                
+                if chosen_focus is None:
+                    # Fallback to nearest if all used
+                    chosen_focus = np.array(self.clusters[sorted_indices[0]]["center"])
+                
+                focus = chosen_focus
             else:
-                focus = self.motion_center
+                # If no clusters, pick a random point near motion center to vary the look
+                # But keep it somewhat central
+                offset = (np.random.rand(3) - 0.5) * np.linalg.norm(self.motion_extent) * 0.3
+                focus = self.motion_center + offset
+                focus = self._clamp_point(focus)
             
+            # Check distance to focus to avoid staring at walls up close
+            view_vec = focus - cam_center
+            dist_to_focus = np.linalg.norm(view_vec)
+            if dist_to_focus < 4.0: # Minimum distance constraint
+                continue
+
             # Check LOS with reduced multiplier
             if self._path_intersects_obstacle(cam_center, focus, radius_multiplier=1.0):
                 continue
                 
             # Found a valid spot! Create a simple subtle motion
+            self.used_focus_points.append(focus)
+
             # Move slightly perpendicular to view direction
-            view_vec = focus - cam_center
-            view_dir = view_vec / np.linalg.norm(view_vec)
+            view_dir = view_vec / dist_to_focus
             right = np.cross(view_dir, np.array([0, 1, 0]))
             if np.linalg.norm(right) < 0.1:
                 right = np.array([1, 0, 0])
             right /= np.linalg.norm(right)
             
-            travel_dist = 1.0 + np.random.rand() * 2.0
+            # Ensure travel distance is reasonable but safe
+            # Increased minimum travel for better dynamism
+            travel_dist = 3.0 + np.random.rand() * 3.0
             start = cam_center - right * travel_dist * 0.5
             end = cam_center + right * travel_dist * 0.5
             
@@ -365,7 +420,7 @@ class CameraPlanner:
             if self._is_in_collision(start, radius_multiplier=0.9) or self._is_in_collision(end, radius_multiplier=0.9):
                 continue
                 
-            print(f"[Planner] Shot {shot_id} (wide_lateral - RELAXED): Found spot after standard search failed. Dist={np.linalg.norm(view_vec):.2f}")
+            print(f"[Planner] Shot {shot_id} (wide_lateral - RELAXED): Found spot after standard search failed. Dist={dist_to_focus:.2f}, Travel={travel_dist:.2f}")
             
             keyframes = [
                 {"time": start_time, "position": start.tolist(), "target": focus.tolist()},
@@ -412,9 +467,27 @@ class CameraPlanner:
 
     def _build_zoom_shot(self, shot_id: str, start_time: float, end_time: float, beat_range) -> Dict:
         shot_num = self._shot_number(shot_id)
-        cluster_idx = self._cluster_index_for_shot(shot_id)
-        focus = self._clamp_point(np.array(self._choose_focus_cluster(cluster_idx)))
-
+        
+        # Choose focus cluster avoiding recent repetitions
+        focus = self.motion_center
+        if self.clusters:
+            # Get all available indices
+            all_indices = list(range(len(self.clusters)))
+            # Filter out those whose centers are close to recently used focus points
+            valid_indices = []
+            for idx in all_indices:
+                center = np.array(self.clusters[idx]["center"])
+                if not any(np.linalg.norm(center - p) < 2.0 for p in self.used_focus_points[-4:]):
+                    valid_indices.append(idx)
+            
+            if not valid_indices:
+                # If all used recently, pick the one used least recently (or just random)
+                valid_indices = all_indices
+            
+            # Pick one randomly from valid
+            cluster_idx = np.random.choice(valid_indices)
+            focus = self._clamp_point(np.array(self._choose_focus_cluster(cluster_idx)))
+        
         # Base direction from motion center to focus
         base_dir = focus - self.motion_center
         if np.linalg.norm(base_dir) < 1e-3:
@@ -479,9 +552,11 @@ class CameraPlanner:
             # clamp and check collisions / line of sight
             start_pos = self._clamp_point(start_pos)
             end_pos = self._clamp_point(end_pos)
-            if self._is_in_collision(start_pos) or self._is_in_collision(end_pos):
+            # Relaxed collision check for zoom (0.8 radius)
+            if self._is_in_collision(start_pos, radius_multiplier=0.8) or self._is_in_collision(end_pos, radius_multiplier=0.8):
                 continue
-            if self._path_intersects_obstacle(start_pos, focus, radius_multiplier=1.2) or self._path_intersects_obstacle(start_pos, end_pos, radius_multiplier=1.2):
+            # Relaxed LOS check (1.0 radius)
+            if self._path_intersects_obstacle(start_pos, focus, radius_multiplier=1.0) or self._path_intersects_obstacle(start_pos, end_pos, radius_multiplier=1.0):
                 # try raising the start height slightly to clear geometry
                 for h_try in [0.1, 0.25, 0.5]:
                     s_try = start_pos.copy()
@@ -801,11 +876,11 @@ class CameraPlanner:
                 original_p2 = points[i+1].copy()
                 
                 # Iteratively pull p1 and p2 towards pull_target
-                for _ in range(10): # Max iterations
-                    if not self._path_intersects_obstacle(p1, p2):
+                for _ in range(15): # Increased iterations
+                    if not self._path_intersects_obstacle(p1, p2, radius_multiplier=1.1): # Check with margin
                         break
-                    p1 = p1 * 0.8 + pull_target * 0.2
-                    p2 = p2 * 0.8 + pull_target * 0.2
+                    p1 = p1 * 0.75 + pull_target * 0.25 # Stronger pull
+                    p2 = p2 * 0.75 + pull_target * 0.25
                 
                 points[i] = p1
                 points[i+1] = p2
@@ -919,34 +994,40 @@ class CameraPlanner:
     def _check_enclosure(self, point: np.ndarray) -> bool:
         """
         Checks if the point is 'enclosed' by obstacles, indicating it's inside a room.
-        Casts rays in 6 cardinal directions.
-        Returns True if at least 3 rays hit obstacles within a reasonable distance.
+        Casts rays in multiple directions (cardinal + diagonal).
+        Returns True if a significant portion of rays hit obstacles.
         """
         if not self.is_indoor or self.obstacle_tree is None:
             return True # Assume valid if not indoor or no obstacles
 
-        hits = 0
         # Use scene diagonal as max ray distance
         max_dist = np.linalg.norm(self.motion_extent)
         
+        # Define directions: 4 cardinal + 4 diagonal horizontal + up + down
         directions = [
-            np.array([1.0, 0.0, 0.0]),
-            np.array([-1.0, 0.0, 0.0]),
-            np.array([0.0, 1.0, 0.0]),
-            np.array([0.0, -1.0, 0.0]),
-            np.array([0.0, 0.0, 1.0]),
-            np.array([0.0, 0.0, -1.0]),
+            np.array([1.0, 0.0, 0.0]), np.array([-1.0, 0.0, 0.0]),
+            np.array([0.0, 0.0, 1.0]), np.array([0.0, 0.0, -1.0]),
+            np.array([0.707, 0.0, 0.707]), np.array([0.707, 0.0, -0.707]),
+            np.array([-0.707, 0.0, 0.707]), np.array([-0.707, 0.0, -0.707]),
+            np.array([0.0, 1.0, 0.0]), np.array([0.0, -1.0, 0.0])
         ]
         
+        hits = 0
         for direction in directions:
-            end_point = point + direction * max_dist
-            # We use a slightly larger radius multiplier to catch sparse walls
-            if self._path_intersects_obstacle(point, end_point, radius_multiplier=1.5):
+            if self._ray_hit(point, direction, max_dist):
                 hits += 1
         
-        # If we are inside a room, we should hit walls/floor/ceiling in most directions.
-        # 3 hits is a safe minimum (e.g. floor + 2 walls).
-        return hits >= 3
+        # We expect to hit something in most directions if we are inside.
+        # 10 rays total.
+        # If we are outside, we might hit the house in 1-3 directions, and ground in 1.
+        # If we are inside, we should hit walls in almost all horizontal directions + floor/ceiling.
+        # Let's require at least 7 hits (70%).
+        return hits >= 7
+
+    def _ray_hit(self, start: np.ndarray, direction: np.ndarray, max_dist: float) -> bool:
+        end = start + direction * max_dist
+        # Use a larger radius multiplier to catch sparse point clouds
+        return self._path_intersects_obstacle(start, end, radius_multiplier=2.0)
 
     def _path_intersects_obstacle(self, start: np.ndarray, end: np.ndarray, radius_multiplier: float = 1.0) -> bool:
         if self.obstacle_tree is None:
