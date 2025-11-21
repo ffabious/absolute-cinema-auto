@@ -295,10 +295,11 @@ class SceneExplorer:
             "metrics": metrics,
         }
 
-    def _generate_occupancy_grid(self, points: np.ndarray, voxel_size: float = 2.0) -> List[List[float]]:
+    def _generate_occupancy_grid(self, points: np.ndarray, voxel_size: float = 0.8) -> List[List[float]]:
         if points.size == 0:
             return []
         quantized = np.floor(points / voxel_size).astype(int)
         unique_voxels = np.unique(quantized, axis=0)
         voxel_centers = (unique_voxels * voxel_size) + (voxel_size / 2.0)
         return voxel_centers.tolist()
+ 

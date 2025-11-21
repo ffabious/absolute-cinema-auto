@@ -70,10 +70,16 @@ function findShot(time) {
     return null;
   }
   const shots = runtimeConfig.camera.shots;
-  const clamped = Math.max(0, Math.min(time, shots[shots.length - 1].endTime));
+  const lastShot = shots[shots.length - 1];
+  const clamped = Math.max(0, Math.min(time, lastShot.endTime));
   let shot = shots[lastShotIndex];
-  if (!(shot && clamped >= shot.startTime && clamped <= shot.endTime)) {
-    shot = shots.find((s) => clamped >= s.startTime && clamped <= s.endTime) ?? shots[shots.length - 1];
+  const isLast = shot === lastShot;
+
+  if (!(shot && clamped >= shot.startTime && (isLast ? clamped <= shot.endTime : clamped < shot.endTime))) {
+    shot = shots.find((s, idx) => {
+      const isLastS = idx === shots.length - 1;
+      return clamped >= s.startTime && (isLastS ? clamped <= s.endTime : clamped < s.endTime);
+    }) ?? lastShot;
     lastShotIndex = shots.indexOf(shot);
   }
   return { shot, time: clamped };
