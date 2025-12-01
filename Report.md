@@ -4,7 +4,17 @@
 
 This report documents problem solving, key ideas, results, and a concrete vision for future improvements.
 
-1. How the problem was solved
+1. Completed tasks
+
+---
+
+- Rendered a video from inside of the scene
+- Detected objects in the rendered video
+- Path planning
+- Obstacle avoidance
+- Artistic result (interesting camera angles and background music)
+
+2. How the problem was solved
 
 ---
 
@@ -15,7 +25,7 @@ This report documents problem solving, key ideas, results, and a concrete vision
   - Camera planning (`src/camera_planner.py`): apply a small set of shot templates (wide lateral establishing shot, zoom-in, orbit, dolly). Shots are snapped to beat indices; keyframes are safety-clamped to bounding volumes.
   - Rendering orchestration (`src/spark_config_builder.py` + `renderer/`): write a runtime JSON contract and drive SparkJS in headless Chromium to render frames, then mux with `ffmpeg`.
 
-2. Novelty and proud tricks
+3. Novelty and proud tricks
 
 ---
 
@@ -23,7 +33,7 @@ This report documents problem solving, key ideas, results, and a concrete vision
 - Lightweight safety heuristic: compute conservative bounding volumes and a clearance ratio; clamp keyframes and bump altitudes when view rays intersect unsafe volumes — a cheap but effective collision reduction method.
 - Deterministic renderer harness: saving per-frame PNGs via a headless Chromium script ensures reproducible renders and easier debugging compared to screen capture.
 
-3. Challenges faced and how they were addressed
+4. Challenges faced and how they were addressed
 
 ---
 
@@ -31,7 +41,7 @@ This report documents problem solving, key ideas, results, and a concrete vision
 - Ambiguous tempo: computed a confidence metric and exportable beat files so graders or users can manually override tempo when necessary.
 - Headless WebGL: added Chromium flags and a local static server to ensure SparkJS can load `.ply` reliably in headless environments.
 
-4. Results and evaluation
+5. Results and evaluation
 
 ---
 
@@ -39,14 +49,14 @@ This report documents problem solving, key ideas, results, and a concrete vision
 - Motion is smoothed with interpolation (e.g., `smoothstep`) and transitions only occur on beats.
 - Empirically, almost all collisions are avoided by safety margins; occasional edge cases remain (see limitations below).
 
-5. Known limitations (short)
+6. Known limitations (short)
 
 ---
 
 - Beat detectors struggle with very ambient music; manual tempo override is available.
 - Path planning sometimes produces a trajectory where the camera briefly ends up outside the scene geometry. Nevertheless, almost all collisions are avoided by the safety heuristics and the camera rarely exits the scene on its own.
 
-6. Vision for future improvements (technical + creative)
+7. Vision for future improvements (technical + creative)
 
 ---
 
@@ -62,7 +72,7 @@ This report documents problem solving, key ideas, results, and a concrete vision
   - Provide an interactive web preview where a user can tweak a small number of shot seeds and re-render only affected shots for quick iteration.
   - Implement stylistic templates (documentary, suspense, portrait) that change camera spacing, focal lengths, and motion priors to generate distinct cinematic feels.
 
-7. Short reproducibility notes
+8. Short reproducibility notes
 
 ---
 
