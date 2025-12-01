@@ -1,77 +1,77 @@
-# Cinematic Navigation Pipeline
+# Cinematic Navigation Pipeline — README
 
-Autonomous film-maker that analyzes a Gaussian splatting scene, locks shots to the beat of a soundtrack, and renders the final video through SparkJS (THREE.js Gaussian splatting renderer) using a headless Chrome harness. The pipeline guarantees at least one wide lateral establishing move and one zoomed focus shot while covering the environment with beat-aligned edits.
+This repository implements an autonomous cinematic navigation pipeline that:
 
-## Prerequisites
+- analyzes a Gaussian-splat `.ply` scene,
+- detects beats from a soundtrack,
+- plans beat-aligned camera shots (wide, zoom, orbit, dolly), and
+- renders frames via SparkJS in headless Chrome before muxing with `ffmpeg`.
 
-- Python 3.11+ with `venv`
-- Node.js 18+ (Puppeteer requires Chromium download)
+## Installation
+
+- Python 3.11+ (create a `venv` recommended)
+- Node.js 18+ (for `renderer` and Puppeteer/Chromium)
 - `ffmpeg` available on `PATH`
 
-Install dependencies from the project root:
+Quick install from the project root:
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 python -m pip install -r requirements.txt
 cd renderer
 npm install
+cd ..
 ```
 
-## Configuration
+## Usage
 
-Defaults live in `configs/config.yaml`. Key knobs:
-
-- `scene.primary_ply` / `scene.fallback_ply`: Gaussian splat `.ply` assets under `input/`
-- `music.track_path`: soundtrack for beat detection and final mix
-- `render`: resolution, fps, min/max clip duration, spatial margins
-- `shots`: beat allocation per shot type, altitude ratios, and the new `safety_margin_ratio` / `clearance_ratio` that keep indoor cameras inside rooms and away from walls
-- `paths`: output locations (JSON reports, runtime config, frames, MP4)
-
-## Running the pipeline
-
-From the repo root:
+Run the full pipeline (analysis → planning → render):
 
 ```bash
 python -m src.pipeline --config configs/config.yaml
 ```
 
-Optional flags:
+Examples:
 
-- `--scene path/to/custom_scene.ply`
-- `--music path/to/song.mp3`
-- `--skip-render` (run analysis/planning only)
-- `--node-bin /custom/node` or `--ffmpeg-bin /opt/homebrew/bin/ffmpeg`
+- Run analysis and planning only (no render):
+  `python -m src.pipeline --config configs/config.yaml --skip-render`
+- Override scene or music:
+  `python -m src.pipeline --scene input/custom.ply --music input/song.mp3`
 
-The final beat-synced panorama appears at `outputs/scene_1/panorama_tour.mp4`. Intermediate artifacts include:
+Outputs (example):
 
-- `outputs/scene_1/scene_analysis.json`: bounding boxes, clusters, coverage nodes
-- `outputs/scene_1/beat_times.json`: detected tempo and beat timestamps
-- `outputs/scene_1/shots.json`: ordered shot definitions with beat-aligned boundaries
-- `outputs/scene_1/runtime_config.json`: SparkJS runtime payload consumed by `renderer/render.js`
+- `outputs/scene_1/scene_analysis.json` — scene PCA, clusters, bounds
+- `outputs/scene_1/beat_times.json` — tempo, beat timestamps, confidence
+- `outputs/scene_1/shots.json` — ordered, beat-snapped shots
+- `outputs/scene_1/runtime_config.json` — payload for SparkJS renderer
+- `outputs/scene_1/panorama_tour.mp4` — final muxed video
 
-## Architecture
+## Algorithm overview
 
-1. **Scene Explorer (`src/explorer.py`)**: parses PLY, computes principal axes, clusters salient regions for zoom shots, and recommends navigation altitudes.
-2. **Beat Tracker (`src/beat_tracker.py`)**: runs `librosa` beat analysis to obtain tempo, beat grid, and confidence.
-3. **Camera Planner (`src/camera_planner.py`)**: cycles through wide lateral, zoom, orbital, and elevated dolly moves. Durations snap to beat multiples to guarantee cut points land exactly on music beats.
-4. **Spark Config Builder (`src/spark_config_builder.py`)**: converts schedule into a JSON contract that the Puppeteer harness understands (camera keyframes, shot metadata, fps, frame output path).
-5. **Renderer Harness (`renderer/render.js`)**: launches headless Chrome with Puppeteer, loads `renderer/spark_scene.html`, and asks SparkJS to render each frame. Frames are written as PNGs before `ffmpeg` muxes them with the soundtrack.
+- Scene Explorer (`src/explorer.py`): samples the splat cloud, computes PCA for dominant axes, clusters salient Gaussian regions for zoom targets, and estimates safe camera altitudes.
+- Beat Tracker (`src/beat_tracker.py`): uses `librosa` (on audio waves) to estimate tempo, beat locations, and a confidence score.
+- Camera Planner (`src/camera_planner.py`): composes a sequence of shot templates (ensures at least one wide lateral establishing shot and one zoom-in) and snaps shot boundaries to beats; applies safety clamps against scene bounding volumes.
+- Spark Config Builder (`src/spark_config_builder.py`): translates shots into a JSON keyframe contract consumed by the renderer.
+- Renderer (`renderer/render.js`): launches headless Chromium, loads SparkJS scene, renders frames as PNGs, and `ffmpeg` muxes frames with the soundtrack.
 
-## Creative Guarantees
+## Dependencies
 
-- Establishing wide lateral sweep covering the dominant principal axis.
-- Zoom-in shot targeting the most salient Gaussian cluster.
-- Additional orbit and dolly shots for variety and coverage.
-- All shot boundaries aligned to music beats for rhythmic editing.
+- Python packages: listed in `requirements.txt` (e.g., `librosa`, `numpy`, `scipy`, `opencv-python`)
+- Node packages: in `renderer/package.json` (Puppeteer / SparkJS runtime)
+- System: `ffmpeg`, headless Chromium (installed by Puppeteer or available on PATH)
 
-## Known Limitations
+## Known limitations
 
-- Beat detection assumes reasonably percussive audio; very ambient tracks may need manual tempo overrides.
-- Obstacle avoidance is approximated via bounding-box constraints—finer collision checks would require point-cloud occlusion tests.
-- Rendering depends on headless Chrome WebGL support; some CI hosts may require `--no-sandbox` tweaks.
-- Only a single required video is automated (object-tour bonus path can be added by extending the planner with object selection heuristics).
+- Beat detection is less reliable on very ambient or textureless music; consider providing a clearer track or overriding tempo manually.
+- Path planning sometimes doesn't work well: on rare scenes the planner can produce a path where the camera momentarily ends up outside of the scene geometry. However, almost all collisions are avoided by the safety margins, and the camera does not move outside of the scene on its own in most runs.
+- Collision avoidance uses bounding-box and clearance heuristics rather than dense point-cloud collision checks — a more robust SDF or ray-marching approach would reduce edge cases.
 
-## Extending
+## Support & Extending
 
-- Plug in an object detector to bias zoom/orbit shots towards semantic targets.
-- Introduce easing curves per shot or blend tree for more advanced cinematography.
-- Export secondary edits (object-focused cut) by instantiating another `CameraPlanner` with different templates.
+- To bias shots toward semantic objects, add an object detector that produces priority targets for the planner.
+- For stricter collision safety, add point-cloud SDF approximations or spatial hashing for per-frame occlusion tests.
+
+## Contact
+
+See `Report.md` for the technical write-up and improvement roadmap.

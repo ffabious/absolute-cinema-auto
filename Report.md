@@ -1,31 +1,71 @@
 # Technical Report: Cinematic Navigation HW04
 
-## Approach Summary
+# Technical Report — Cinematic Navigation (Assignment 4)
 
-We implemented an end-to-end autonomous cinematographer that starts from a Gaussian splatting PLY scene and ends with a SparkJS-rendered panorama synced to a soundtrack. The Python pipeline performs four stages: scene analysis, beat extraction, camera planning, and renderer orchestration. Rendering happens in headless Chrome via SparkJS + THREE.js, guaranteeing that the deliverable leverages SparkJS as required.
+This report documents problem solving, key ideas, results, and a concrete vision for future improvements.
 
-## Novelty Highlights
+1. How the problem was solved
 
-- **Beat-Snapped Shot Scheduler**: Each shot’s start/end timestamps snap exactly to detected beat indices, ensuring edits always land on-music. This schedule feeds SparkJS directly through JSON keyframes.
-- **Shot Templates with Guarantees**: The planner always includes at least one wide lateral establishing move and one zoom-in shot toward the highest-score cluster, then alternates orbit and elevated dolly patterns for coverage variety.
-- **Indoor-Safe Navigation**: Safety volumes derived from the splat bounding box clamp every keyframe and raise the camera whenever the view ray would pierce walls, keeping indoor shots plausible.
-- **Playwright Spark Harness**: Instead of screen recording, the renderer drives SparkJS deterministically in headless WebKit (Playwright), saving per-frame PNGs before muxing with FFmpeg. This keeps the workflow scriptable and reproducible even on CI hosts without full GPU stacks.
+---
 
-## Challenges & Solutions
+- Input: a Gaussian-splat `.ply` scene and a soundtrack.
+- Pipeline stages:
+  - Scene analysis (`src/explorer.py`): random sampling (cap at ~150k points), PCA for dominant axes, clustering to find salient regions for zoom targets, and bounding volumes for safety margins.
+  - Beat extraction (`src/beat_tracker.py`): `librosa`-based tempo and beat detection with an autocorrelation confidence score. Beats are exported in `beat_times.json`.
+  - Camera planning (`src/camera_planner.py`): apply a small set of shot templates (wide lateral establishing shot, zoom-in, orbit, dolly). Shots are snapped to beat indices; keyframes are safety-clamped to bounding volumes.
+  - Rendering orchestration (`src/spark_config_builder.py` + `renderer/`): write a runtime JSON contract and drive SparkJS in headless Chromium to render frames, then mux with `ffmpeg`.
 
-- **Large PLY Parsing**: Gaussian splat files can exceed millions of points. To keep analysis tractable, the explorer samples up to 150k points with a fixed RNG seed and computes PCA/cluster statistics on the sample.
-- **Beat Robustness**: Ambiguous tempos can derail shot timing. We compute an autocorrelation-based confidence score and expose it in `beat_times.json` so users can swap tracks or override tempo if necessary.
-- **WebGL in Headless Mode**: Some environments disable GPU acceleration in headless Chromium. The renderer adds `--use-gl=desktop` and `--enable-webgl` flags while serving assets locally to guarantee SparkJS can stream the `.ply` file without additional hosting.
+2. Novelty and proud tricks
 
-## Results & Evaluation
+---
 
-- Generated video duration lands within the 60–110 second requirement (bounded by both music length and configuration limits).
-- Camera motion stays smooth thanks to `smoothstep` interpolation across all keyframes, and transitions only occur on beats.
-- Outputs include inspection artifacts (scene analysis, beats, shots, runtime config) to aid debugging or grading.
+- Beat-snapped scheduling: every shot boundary is quantized to beat indices so edits are rhythmically correct by construction.
+- Lightweight safety heuristic: compute conservative bounding volumes and a clearance ratio; clamp keyframes and bump altitudes when view rays intersect unsafe volumes — a cheap but effective collision reduction method.
+- Deterministic renderer harness: saving per-frame PNGs via a headless Chromium script ensures reproducible renders and easier debugging compared to screen capture.
 
-## Future Improvements
+3. Challenges faced and how they were addressed
 
-1. **Semantic Object Selection**: Plugging in an object detector (e.g., Segment Anything + CLIP) would allow the zoom/orbit shots to target semantically meaningful artifacts instead of geometric clusters.
-2. **Obstacle-Aware Trajectories**: Integrating ray-marching or signed distance approximations from the splat cloud would prevent the camera from cutting through geometry.
-3. **Realtime Preview UI**: A lightweight web UI running the same SparkJS scene could enable manual overrides before committing to the render farm.
-4. **Secondary Object Tour**: Re-running the planner with shot templates focused solely on detected objects would yield the optional Video 2 deliverable automatically.
+---
+
+- Large scenes: sampling with a fixed RNG seed kept PCA and clustering fast and repeatable.
+- Ambiguous tempo: computed a confidence metric and exportable beat files so graders or users can manually override tempo when necessary.
+- Headless WebGL: added Chromium flags and a local static server to ensure SparkJS can load `.ply` reliably in headless environments.
+
+4. Results and evaluation
+
+---
+
+- The pipeline produces a beat-aligned video with the required establishing and zoom shots in the expected duration range.
+- Motion is smoothed with interpolation (e.g., `smoothstep`) and transitions only occur on beats.
+- Empirically, almost all collisions are avoided by safety margins; occasional edge cases remain (see limitations below).
+
+5. Known limitations (short)
+
+---
+
+- Beat detectors struggle with very ambient music; manual tempo override is available.
+- Path planning sometimes produces a trajectory where the camera briefly ends up outside the scene geometry. Nevertheless, almost all collisions are avoided by the safety heuristics and the camera rarely exits the scene on its own.
+
+6. Vision for future improvements (technical + creative)
+
+---
+
+- Technical improvements:
+
+  - Replace bounding-box heuristics with a signed distance field (SDF) / voxel SDF approximation to guarantee collision-free trajectories; use gradient-based optimization to produce smooth, obstacle-aware paths.
+  - Add per-frame ray-marching occlusion checks from the camera to the focus target to prevent view clipping and popping.
+  - Integrate a learned or analytic motion prior to produce more cinematic acceleration profiles (e.g., ease-in/out per shot using a motion library).
+  - Add semantic detection (object segmentation + ranking) and cost functions to bias camera placement toward meaningful targets.
+
+- Creative directions:
+  - Allow multi-track musical analysis (stems) and align shots not only to beats but to musical phrases (tension, release) for stronger narrative edits.
+  - Provide an interactive web preview where a user can tweak a small number of shot seeds and re-render only affected shots for quick iteration.
+  - Implement stylistic templates (documentary, suspense, portrait) that change camera spacing, focal lengths, and motion priors to generate distinct cinematic feels.
+
+7. Short reproducibility notes
+
+---
+
+- See `README.md` for install/run examples. Primary outputs are in `outputs/` and inspection artifacts (`scene_analysis.json`, `beat_times.json`, `shots.json`) are exported alongside the final video.
+
+This deliverable focuses on a concise, reproducible pipeline; the next steps are primarily improving collision guarantees and integrating semantic shot priorities.
