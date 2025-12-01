@@ -45,16 +45,41 @@ async function main() {
     const prefix = config.output.framePrefix;
     const padding = config.output.framePadding;
 
+    const startTime = Date.now();
+    let lastUpdateTime = startTime;
+
     for (let frame = 0; frame < totalFrames; frame += 1) {
       const t = frame / fps;
       await page.evaluate((time) => window.renderFrame(time), t);
       const filename = `${prefix}${String(frame).padStart(padding, "0")}.png`;
       const outputPath = path.join(framesDir, filename);
       await page.screenshot({ path: outputPath });
-      if (frame % 30 === 0) {
-        console.log(`Rendered frame ${frame}/${totalFrames}`);
+
+      // Update progress display (throttled to avoid excessive console updates)
+      const now = Date.now();
+      if (now - lastUpdateTime >= 500 || frame === totalFrames - 1) {
+        lastUpdateTime = now;
+        const elapsed = (now - startTime) / 1000;
+        const progress = (frame + 1) / totalFrames;
+        const eta = progress > 0 ? (elapsed / progress) * (1 - progress) : 0;
+        const rate = elapsed > 0 ? (frame + 1) / elapsed : 0;
+
+        // Build progress bar
+        const barWidth = 30;
+        const filled = Math.round(barWidth * progress);
+        const bar = "█".repeat(filled) + "░".repeat(barWidth - filled);
+
+        // Format times
+        const elapsedStr = formatTime(elapsed);
+        const etaStr = formatTime(eta);
+        const percent = (progress * 100).toFixed(1);
+
+        // Clear line and write progress
+        process.stdout.write(`\r${bar} ${percent}% | ${frame + 1}/${totalFrames} | ${rate.toFixed(1)} fps | ${elapsedStr}<${etaStr}`);
       }
     }
+    // Final newline after progress bar
+    console.log();
   } finally {
     await browser.close();
     await staticServer.stop();
@@ -85,6 +110,13 @@ function parseArgs(argv) {
     }
   }
   return out;
+}
+
+function formatTime(seconds) {
+  if (!isFinite(seconds) || seconds < 0) return "??:??";
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
 }
 
 main().catch((err) => {

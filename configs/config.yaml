@@ -2,7 +2,7 @@ scene:
   primary_ply: input/ConferenceHall.ply
   fallback_ply: input/scene.ply
 music:
-  track_path: input/music.mp3
+  track_path: input/cinema.mp3
 render:
   fps: 30
   resolution:
@@ -16,13 +16,9 @@ shots:
   beats_per_shot: [32, 24, 16, 24]
   orbit_altitude_ratio: 0.35
   dolly_altitude_ratio: 0.15
-  safety_margin_ratio: 0.08
-  clearance_ratio: 0.12
-  shot_mix:
-    wide_lateral: 0.7
-    zoom_focus: 0.3
-    orbit: 0.0
-    elevated_dolly: 0.0
+  safety_margin_ratio: 0.10
+  clearance_ratio: 0.15
+  # Only travel and focus shots are used (smooth 2-point interpolation)
   ease: smoothstep
 paths:
   working_dir: outputs/scene_1

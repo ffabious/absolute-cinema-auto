@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Optional
+import heapq
 
 import numpy as np
 from scipy.spatial import KDTree
@@ -21,11 +20,428 @@ class PlannerConfig:
     max_duration: float
     safety_margin_ratio: float
     clearance_ratio: float
+    duration_scale: float = 3.0
     shot_mix: Dict[str, float] | None = None
 
 
+@dataclass
+class ViewPoint:
+    """A validated camera position with visibility info."""
+    position: np.ndarray
+    visible_clusters: List[int]  # Indices of clusters visible from here
+    view_score: float  # Quality score for this viewpoint
+    neighbors: List[int]  # Indices of connected viewpoints
+
+
+class NavigableSpace:
+    """Pre-computed grid of valid camera positions with connectivity.
+    
+    This approach solves the camera-in-wall problem by:
+    1. Pre-computing ALL valid positions before shot planning begins
+    2. Building a connectivity graph so we only move between validated positions
+    3. Checking obstacle clearance during grid construction, not during shot planning
+    """
+    
+    def __init__(
+        self,
+        scene_info: Dict,
+        grid_resolution: float = 3.0,
+        min_obstacle_distance: float = 2.0,
+    ):
+        self.scene_info = scene_info
+        self.grid_resolution = grid_resolution
+        self.min_obstacle_distance = min_obstacle_distance
+        
+        # Scene bounds
+        safe_bounds = scene_info.get("safe_bounds") or scene_info["bounds"]
+        self.bounds_min = np.array(safe_bounds.get("min", scene_info["bounds"]["min"]))
+        self.bounds_max = np.array(safe_bounds.get("max", scene_info["bounds"]["max"]))
+        self.bounds_extent = self.bounds_max - self.bounds_min
+        
+        # Floor/ceiling from environment
+        env_metrics = scene_info.get("environment", {}).get("metrics", {})
+        self.floor_height = float(env_metrics.get("floor_height", self.bounds_min[1]))
+        self.ceiling_height = float(env_metrics.get("ceiling_height", self.bounds_max[1]))
+        
+        # Obstacles - the occupancy grid from scene analysis
+        obstacles = np.array(scene_info.get("occupancy", []))
+        self.obstacle_tree = KDTree(obstacles) if obstacles.size > 0 else None
+        
+        # Clusters (points of interest)
+        self.clusters = scene_info.get("clusters", [])
+        self.cluster_centers = np.array([c["center"] for c in self.clusters]) if self.clusters else np.array([])
+        
+        # Environment type (indoor/outdoor)
+        env_info = scene_info.get("environment", {})
+        self.is_indoor = env_info.get("type") == "indoor"
+        
+        # Will be populated by build()
+        self.viewpoints: List[ViewPoint] = []
+        self.position_tree: Optional[KDTree] = None
+        
+    def build(self) -> None:
+        """Build the navigable space grid and connectivity graph."""
+        print("[NavigableSpace] Building navigable space grid...")
+        
+        # Generate candidate positions on a 3D grid
+        candidates = self._generate_grid_candidates()
+        print(f"[NavigableSpace] Generated {len(candidates)} grid candidates")
+        
+        # Filter to valid positions (not in obstacles, has visibility)
+        valid_positions = []
+        valid_scores = []
+        valid_visible = []
+        
+        for pos in candidates:
+            if self._is_in_obstacle(pos):
+                continue
+            
+            # For indoor scenes, verify position is inside the environment (surrounded by walls)
+            if self.is_indoor and not self._is_inside_environment(pos):
+                continue
+            
+            # Check visibility to clusters
+            visible = self._compute_visible_clusters(pos)
+            if len(visible) == 0 and len(self.clusters) > 0:
+                # Must see at least one cluster if clusters exist
+                continue
+            
+            score = self._compute_view_score(pos, visible)
+            valid_positions.append(pos)
+            valid_scores.append(score)
+            valid_visible.append(visible)
+        
+        print(f"[NavigableSpace] {len(valid_positions)} positions passed validation")
+        
+        if len(valid_positions) == 0:
+            # Fallback: use scene center and try to find ANY valid position
+            print("[NavigableSpace] No valid positions found, attempting fallback...")
+            center = (self.bounds_min + self.bounds_max) / 2
+            
+            # Try sampling around center with reducing obstacle distance
+            fallback_found = False
+            for obstacle_mult in [0.5, 0.25, 0.1, 0.0]:
+                test_dist = self.min_obstacle_distance * obstacle_mult
+                if self.obstacle_tree is None or self._distance_to_obstacle(center) > test_dist:
+                    valid_positions = [center]
+                    valid_scores = [1.0]
+                    valid_visible = [list(range(len(self.clusters)))]
+                    fallback_found = True
+                    print(f"[NavigableSpace] Fallback: using scene center with obstacle_mult={obstacle_mult}")
+                    break
+            
+            if not fallback_found:
+                # Last resort: use center regardless
+                valid_positions = [center]
+                valid_scores = [1.0]
+                valid_visible = [list(range(len(self.clusters)))]
+                print("[NavigableSpace] Fallback: using scene center (no obstacle check)")
+        
+        # Build KD-tree for connectivity queries
+        positions_array = np.array(valid_positions)
+        self.position_tree = KDTree(positions_array)
+        
+        # Create viewpoints with connectivity
+        max_neighbor_dist = self.grid_resolution * 2.5
+        
+        for i, (pos, score, visible) in enumerate(zip(valid_positions, valid_scores, valid_visible)):
+            # Find nearby viewpoints
+            nearby_indices = self.position_tree.query_ball_point(pos, max_neighbor_dist)
+            
+            # Filter to connected neighbors (path must be clear)
+            neighbors = []
+            for j in nearby_indices:
+                if i == j:
+                    continue
+                other_pos = valid_positions[j]
+                if not self._path_blocked(pos, other_pos):
+                    neighbors.append(j)
+            
+            self.viewpoints.append(ViewPoint(
+                position=pos,
+                visible_clusters=visible,
+                view_score=score,
+                neighbors=neighbors,
+            ))
+        
+        print(f"[NavigableSpace] Built {len(self.viewpoints)} viewpoints with connectivity")
+        
+        # Report connectivity stats
+        if self.viewpoints:
+            avg_neighbors = sum(len(vp.neighbors) for vp in self.viewpoints) / len(self.viewpoints)
+            max_neighbors = max(len(vp.neighbors) for vp in self.viewpoints)
+            isolated = sum(1 for vp in self.viewpoints if len(vp.neighbors) == 0)
+            print(f"[NavigableSpace] Connectivity: avg={avg_neighbors:.1f}, max={max_neighbors}, isolated={isolated}")
+    
+    def _generate_grid_candidates(self) -> List[np.ndarray]:
+        """Generate a 3D grid of candidate positions."""
+        candidates = []
+        
+        # Determine grid steps with margin from bounds
+        margin = self.bounds_extent * 0.1
+        start = self.bounds_min + margin
+        end = self.bounds_max - margin
+        
+        # Use fewer height levels, biased toward middle of space
+        vertical_span = self.ceiling_height - self.floor_height
+        if vertical_span < 0.1:
+            vertical_span = self.bounds_extent[1]
+            self.floor_height = self.bounds_min[1]
+            self.ceiling_height = self.bounds_max[1]
+        
+        height_levels = [
+            self.floor_height + 0.25 * vertical_span,
+            self.floor_height + 0.40 * vertical_span,
+            self.floor_height + 0.55 * vertical_span,
+            self.floor_height + 0.70 * vertical_span,
+        ]
+        
+        x_range = end[0] - start[0]
+        z_range = end[2] - start[2]
+        
+        x_steps = max(4, int(x_range / self.grid_resolution))
+        z_steps = max(4, int(z_range / self.grid_resolution))
+        
+        for height in height_levels:
+            if height < self.bounds_min[1] or height > self.bounds_max[1]:
+                continue
+            for xi in range(x_steps):
+                x = start[0] + (xi / max(1, x_steps - 1)) * x_range if x_steps > 1 else (start[0] + end[0]) / 2
+                for zi in range(z_steps):
+                    z = start[2] + (zi / max(1, z_steps - 1)) * z_range if z_steps > 1 else (start[2] + end[2]) / 2
+                    candidates.append(np.array([x, height, z]))
+        
+        return candidates
+    
+    def _distance_to_obstacle(self, pos: np.ndarray) -> float:
+        """Get distance to nearest obstacle."""
+        if self.obstacle_tree is None:
+            return float('inf')
+        dist, _ = self.obstacle_tree.query(pos)
+        return float(dist)
+    
+    def _is_in_obstacle(self, pos: np.ndarray) -> bool:
+        """Check if position is too close to obstacles."""
+        return self._distance_to_obstacle(pos) < self.min_obstacle_distance
+    
+    def _is_inside_environment(self, pos: np.ndarray) -> bool:
+        """Check if position is inside the environment using multiple robust methods.
+        
+        For indoor scenes, we use several stringent checks:
+        1. Proximity check: Position must be close to occupied voxels (geometry)
+        2. Density check: Must have sufficient geometry density in vicinity
+        3. Enclosure check: Rays cast outward should hit walls in most directions
+        4. Vertical check: Must have both floor below AND ceiling above
+        5. Diagonal check: Additional rays at 45-degree angles for corners
+        """
+        if self.obstacle_tree is None:
+            return True
+        
+        scene_diagonal = np.linalg.norm(self.bounds_extent)
+        
+        # Check 1: Proximity to occupied space (stricter threshold)
+        # A position inside the building should be close to some geometry
+        dist_to_nearest = self._distance_to_obstacle(pos)
+        max_allowed_dist = scene_diagonal * 0.10  # Max 10% of scene extent (stricter)
+        if dist_to_nearest > max_allowed_dist:
+            return False
+        
+        # Check 2: Density check - count obstacles within a radius
+        # Indoor positions should have geometry nearby in multiple directions
+        density_radius = scene_diagonal * 0.15
+        nearby_indices = self.obstacle_tree.query_ball_point(pos, density_radius)
+        min_nearby_points = 50  # Need at least this many geometry points nearby
+        if len(nearby_indices) < min_nearby_points:
+            return False
+        
+        # Check 3: Must be within the tight bounds (where most geometry is)
+        tight_bounds = self.scene_info.get("tight_bounds", {})
+        if tight_bounds:
+            tight_min = np.array(tight_bounds.get("min", self.bounds_min.tolist()))
+            tight_max = np.array(tight_bounds.get("max", self.bounds_max.tolist()))
+            # Stricter margin - only 5% outside tight bounds allowed
+            margin = (tight_max - tight_min) * 0.05
+            if np.any(pos < tight_min - margin) or np.any(pos > tight_max + margin):
+                return False
+        
+        # Check 4: Enclosure check with 24 rays (16 horizontal + 8 diagonal)
+        ray_length = scene_diagonal * 0.35
+        
+        # Horizontal rays (16 directions)
+        horizontal_hits = 0
+        for angle in np.linspace(0, 2 * np.pi, 16, endpoint=False):
+            direction = np.array([np.cos(angle), 0.0, np.sin(angle)])
+            if self._ray_hits_obstacle(pos, direction, ray_length):
+                horizontal_hits += 1
+        
+        # Diagonal rays (8 directions at 45 degrees up and down)
+        diagonal_hits = 0
+        for angle in np.linspace(0, 2 * np.pi, 8, endpoint=False):
+            # Upward diagonal
+            dir_up = np.array([np.cos(angle) * 0.707, 0.707, np.sin(angle) * 0.707])
+            if self._ray_hits_obstacle(pos, dir_up, ray_length):
+                diagonal_hits += 1
+            # Downward diagonal
+            dir_down = np.array([np.cos(angle) * 0.707, -0.707, np.sin(angle) * 0.707])
+            if self._ray_hits_obstacle(pos, dir_down, ray_length):
+                diagonal_hits += 1
+        
+        # Check 5: Vertical rays - MUST have BOTH floor AND ceiling
+        up_dir = np.array([0.0, 1.0, 0.0])
+        down_dir = np.array([0.0, -1.0, 0.0])
+        has_ceiling = self._ray_hits_obstacle(pos, up_dir, ray_length * 0.6)
+        has_floor = self._ray_hits_obstacle(pos, down_dir, ray_length * 0.6)
+        
+        # Strict requirements for indoor:
+        # - At least 75% horizontal hits (12 of 16)
+        # - At least 50% diagonal hits (8 of 16)
+        # - MUST have both floor AND ceiling
+        horizontal_ok = horizontal_hits >= 12
+        diagonal_ok = diagonal_hits >= 8
+        vertical_ok = has_floor and has_ceiling
+        
+        return horizontal_ok and diagonal_ok and vertical_ok
+    
+    def _ray_hits_obstacle(self, start: np.ndarray, direction: np.ndarray, max_dist: float) -> bool:
+        """Check if a ray from start in direction hits an obstacle within max_dist."""
+        if self.obstacle_tree is None:
+            return False
+        
+        # Sample along the ray with finer granularity
+        steps = max(10, int(max_dist / (self.min_obstacle_distance * 0.5)))
+        for i in range(1, steps + 1):
+            t = i / steps
+            point = start + direction * (max_dist * t)
+            dist_to_obstacle = self._distance_to_obstacle(point)
+            # Hit if we get close to any obstacle
+            if dist_to_obstacle < self.min_obstacle_distance * 2.0:
+                return True
+        
+        return False
+
+    def _path_blocked(self, start: np.ndarray, end: np.ndarray) -> bool:
+        """Check if path between two points is blocked by obstacles."""
+        if self.obstacle_tree is None:
+            return False
+        
+        dist = np.linalg.norm(end - start)
+        if dist < 0.1:
+            return False
+        
+        # Sample points along the path
+        steps = max(3, int(dist / (self.min_obstacle_distance * 0.5)))
+        for i in range(1, steps):
+            t = i / steps
+            point = start * (1 - t) + end * t
+            if self._is_in_obstacle(point):
+                return True
+        return False
+    
+    def _compute_visible_clusters(self, pos: np.ndarray) -> List[int]:
+        """Compute which clusters are visible from this position."""
+        if len(self.clusters) == 0:
+            return []
+        
+        visible = []
+        for i, cluster in enumerate(self.clusters):
+            center = np.array(cluster["center"])
+            if not self._path_blocked(pos, center):
+                visible.append(i)
+        return visible
+    
+    def _compute_view_score(self, pos: np.ndarray, visible_clusters: List[int]) -> float:
+        """Score a viewpoint based on what it can see."""
+        if len(visible_clusters) == 0:
+            return 0.1  # Base score for having valid position
+        
+        score = 0.0
+        for i in visible_clusters:
+            cluster = self.clusters[i]
+            center = np.array(cluster["center"])
+            dist = np.linalg.norm(pos - center)
+            radius = cluster.get("radius", 5.0)
+            
+            # Prefer positions at good viewing distance (1-3x cluster radius)
+            ideal_dist = radius * 2.0
+            dist_score = 1.0 / (1.0 + abs(dist - ideal_dist) / max(ideal_dist, 1.0))
+            
+            # Weight by cluster importance
+            cluster_score = cluster.get("score", 1.0)
+            
+            score += dist_score * cluster_score
+        
+        return score
+    
+    def find_path(self, start_idx: int, end_idx: int) -> List[int]:
+        """Find shortest path between two viewpoints using A*."""
+        if start_idx == end_idx:
+            return [start_idx]
+        
+        if start_idx >= len(self.viewpoints) or end_idx >= len(self.viewpoints):
+            return []
+        
+        end_pos = self.viewpoints[end_idx].position
+        
+        # A* search
+        open_set = [(0.0, start_idx)]
+        came_from: Dict[int, int] = {}
+        g_score: Dict[int, float] = {start_idx: 0.0}
+        
+        while open_set:
+            _, current = heapq.heappop(open_set)
+            
+            if current == end_idx:
+                # Reconstruct path
+                path = [current]
+                while current in came_from:
+                    current = came_from[current]
+                    path.append(current)
+                return path[::-1]
+            
+            for neighbor in self.viewpoints[current].neighbors:
+                tentative_g = g_score[current] + np.linalg.norm(
+                    self.viewpoints[current].position - self.viewpoints[neighbor].position
+                )
+                
+                if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g
+                    h = float(np.linalg.norm(self.viewpoints[neighbor].position - end_pos))
+                    heapq.heappush(open_set, (tentative_g + h, neighbor))
+        
+        return []  # No path found
+    
+    def get_best_viewpoints_for_cluster(self, cluster_idx: int, count: int = 5) -> List[int]:
+        """Get the best viewpoints for viewing a specific cluster."""
+        if cluster_idx >= len(self.clusters):
+            return []
+        
+        cluster_center = np.array(self.clusters[cluster_idx]["center"])
+        candidates = []
+        
+        for i, vp in enumerate(self.viewpoints):
+            if cluster_idx in vp.visible_clusters:
+                dist = np.linalg.norm(vp.position - cluster_center)
+                # Score: prefer moderate distance, weight by view score
+                dist_penalty = abs(dist - 10.0) / 10.0
+                score = vp.view_score / (1 + dist_penalty)
+                candidates.append((score, i))
+        
+        candidates.sort(reverse=True)
+        return [idx for _, idx in candidates[:count]]
+
+
 class CameraPlanner:
-    """Turns beats + scene cues into timed camera shots."""
+    """Turns beats + scene cues into timed camera shots using navigable space.
+    
+    Key differences from previous approach:
+    1. Pre-computes all valid camera positions BEFORE shot planning
+    2. Uses graph-based pathfinding instead of random sampling
+    3. Camera never starts in a wall because all positions are pre-validated
+    4. Shot variety achieved through deterministic alternation, not random retry loops
+    5. Uses beat strength/downbeats to time shot transitions on important beats
+    6. Tracks spatial positions to avoid consecutive shots in similar locations
+    """
 
     def __init__(
         self,
@@ -36,10 +452,24 @@ class CameraPlanner:
         self.scene = scene_info
         self.beats = beat_info
         self.config = config
+        
+        # Build navigable space with adaptive parameters
+        diagonal = np.linalg.norm(np.array(scene_info["bounds"]["extent"]))
+        grid_res = max(2.0, min(5.0, diagonal * 0.04))  # Adaptive grid resolution
+        obstacle_dist = max(1.0, min(3.0, diagonal * 0.015))  # Adaptive obstacle distance
+        
+        print(f"[Planner] Scene diagonal: {diagonal:.1f}, grid_res: {grid_res:.2f}, obstacle_dist: {obstacle_dist:.2f}")
+        
+        self.nav_space = NavigableSpace(
+            scene_info,
+            grid_resolution=grid_res,
+            min_obstacle_distance=obstacle_dist,
+        )
+        self.nav_space.build()
+        
+        # Scene geometry
         self.bounds_center = np.array(scene_info["bounds"]["center"])
         self.extent = np.array(scene_info["bounds"]["extent"])
-        self.axes = np.array(scene_info["principal_axes"])
-        self.vertical_axis_index = int(scene_info.get("vertical_axis_index", 1))
         self.clusters = scene_info.get("clusters", [])
         safe_bounds = scene_info.get("safe_bounds") or scene_info["bounds"]
         self.safe_min = np.array(safe_bounds.get("min", scene_info["bounds"]["min"]))
@@ -114,44 +544,64 @@ class CameraPlanner:
 
         audio_duration = float(self.beats.get("duration", beat_times[-1]))
         target_duration = min(max(audio_duration, self.config.min_duration), self.config.max_duration)
-        shot_generators = self._shot_generators()
+        
+        # Get downbeat indices for timing shot transitions on important beats
+        downbeat_indices = self.beats.get("downbeat_indices", [])
+        beat_strengths = self.beats.get("beat_strengths", [])
+        
+        # Build shot segments based on downbeats
+        # Each shot spans from one downbeat to the next (or next-next for longer shots)
+        shot_segments = self._build_shot_segments_from_downbeats(
+            beat_times, downbeat_indices, beat_strengths, target_duration
+        )
+        
+        print(f"[Planner] Created {len(shot_segments)} shot segments from downbeats")
 
         timeline: List[Dict] = []
-        beat_index = 0
         shot_counter = 1
-        beats_cycle = itertools.cycle(self.config.beats_per_shot)
 
-        while beat_index < len(beat_times) - 1:
-            beats_for_shot = next(beats_cycle)
-            start_idx = beat_index
-            end_idx = min(len(beat_times) - 1, beat_index + beats_for_shot)
+        for start_idx, end_idx in shot_segments:
             start_time = beat_times[start_idx]
             end_time = beat_times[end_idx]
-            if end_time - beat_times[0] > target_duration:
-                break
             
-            # Try to generate a shot, retrying with different types if needed
-            shot = None
-            # Limit retries to avoid infinite loops, but try enough to cycle through types
-            for _ in range(5):
-                shot_id_template, builder = next(shot_generators)
-                shot = builder(
+            self.shot_counter = shot_counter
+            
+            # Alternate between travel and focus shots only (no multi-keyframe orbit)
+            # This ensures smooth 2-point interpolation without direction changes
+            shot_type = shot_counter % 2
+            if shot_type == 1:
+                shot = self._build_travel_shot(
+                    shot_id=f"shot_{shot_counter:02d}",
+                    start_time=start_time,
+                    end_time=end_time,
+                    beat_range=(start_idx, end_idx),
+                )
+            else:
+                shot = self._build_focus_shot(
+                    shot_id=f"shot_{shot_counter:02d}",
+                    start_time=start_time,
+                    end_time=end_time,
+                    beat_range=(start_idx, end_idx),
+                )
+            
+            if shot:
+                timeline.append(shot)
+                shot_counter += 1
+            else:
+                # Try fallback
+                shot = self._build_fallback_shot(
                     shot_id=f"shot_{shot_counter:02d}",
                     start_time=start_time,
                     end_time=end_time,
                     beat_range=(start_idx, end_idx),
                 )
                 if shot:
-                    break
-            
-            if shot:
-                timeline.append(shot)
-                shot_counter += 1
-            else:
-                print(f"[Planner] Failed to generate shot {shot_counter} for time {start_time:.2f}-{end_time:.2f}")
+                    timeline.append(shot)
+                    shot_counter += 1
+                else:
+                    print(f"[Planner] Failed to generate shot {shot_counter}")
 
-            beat_index = end_idx
-
+        # Normalize times to start at 0
         offset = beat_times[0]
         for shot in timeline:
             shot["startTime"] -= offset
@@ -170,6 +620,8 @@ class CameraPlanner:
             "tempo": self.beats.get("tempo"),
             "beat_confidence": self.beats.get("confidence"),
             "beat_times": [bt - offset for bt in beat_times],
+            "downbeat_indices": downbeat_indices,
+            "beat_strengths": beat_strengths,
         }
         return schedule
 
@@ -373,10 +825,15 @@ class CameraPlanner:
             if self._path_intersects_obstacle(cam_center, candidate_focus, radius_multiplier=los_mult):
                 los_rejections += 1
                 continue
-                
-            # 6. Define Motion Axis (perpendicular to view direction)
-            # view_dir is (x, 0, z), up is (0, 1, 0) -> right is (z, 0, -x)
-            motion_axis = np.array([view_dir[2], 0, -view_dir[0]])
+            
+            # Check spatial distance from recent shot positions
+            if self._is_too_close_to_recent_shots(vp.position):
+                continue
+            
+            score = vp.view_score
+            
+            # Strong penalty for already being used (exponential decay)
+            score *= (0.4 ** use_count)
             
             # 7. Define Travel Path
             scene_diag = np.linalg.norm(self.motion_extent)
@@ -569,20 +1026,15 @@ class CameraPlanner:
         self.used_camera_centers.append(chosen_start)
 
         keyframes = [
-            {"time": start_time, "position": chosen_start.tolist(), "target": focus.tolist()},
-            {"time": end_time, "position": chosen_end.tolist(), "target": focus.tolist()},
+            {"time": start_time, "position": start_vp.position.tolist(), "target": target.tolist()},
+            {"time": end_time, "position": clamped_end_pos.tolist(), "target": target.tolist()},
         ]
-
-        print(f"[Planner] Shot {shot_id} (zoom_focus): Focus={focus.round(2)}, AngleOffset={self.last_zoom_angle:.1f}deg, Dist={chosen_out:.2f}->{chosen_in:.2f}")
-
+        
+        print(f"[Planner] Shot {shot_id} (focus): Cluster {target_cluster_idx}, VP {start_vp_idx} -> {end_vp_idx}, speed={speed:.1f}/s")
+        
         return self._package_shot(
-            shot_id,
-            "zoom_focus",
-            start_time,
-            end_time,
-            beat_range,
-            self._finalize_keyframes(keyframes),
-            description="Push in towards highlighted object",
+            shot_id, "focus", start_time, end_time, beat_range, keyframes,
+            description=f"Focus shot on cluster {target_cluster_idx}",
         )
 
     def _build_orbit_shot(self, shot_id: str, start_time: float, end_time: float, beat_range) -> Dict:
